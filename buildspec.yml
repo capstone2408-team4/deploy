@@ -1,0 +1,48 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      # Login to ECR
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com
+      
+      # Create ECR repository if it doesn't exist
+      - aws ecr describe-repositories --repository-names providence-api || aws ecr create-repository --repository-name providence-api
+      
+      # Set environment variables for build
+      - export IMAGE_TAG=latest
+      - export REPOSITORY_URI=$AWS_ACCOUNT_ID.dkr.ecr.$AWS_DEFAULT_REGION.amazonaws.com/providence-api
+      
+      # Debug information
+      - echo "Source Directory Contents:"
+      - ls -la $CODEBUILD_SRC_DIR
+      - echo "Deploy Directory Contents:"
+      - ls -la $CODEBUILD_SRC_DIR_deploy
+      
+  build:
+    commands:
+      # Move to source directory where providence code lives
+      - cd $CODEBUILD_SRC_DIR
+      
+      # Build the Docker image using backend Dockerfile
+      - echo Building Providence API image...
+      - docker build -t $REPOSITORY_URI:$IMAGE_TAG -f backend/Dockerfile .
+      
+      # Run basic health check on the image
+      - echo Running container health check...
+      - docker run --rm $REPOSITORY_URI:$IMAGE_TAG node -e "console.log('Node.js runtime check passed')"
+      
+  post_build:
+    commands:
+      # Push to ECR
+      - echo Pushing to Amazon ECR...
+      - docker push $REPOSITORY_URI:$IMAGE_TAG
+      
+      # Generate image definition file for ECS
+      - echo Writing image definitions file...
+      - printf '{"ImageURI":"%s"}' $REPOSITORY_URI:$IMAGE_TAG > imageDefinitions.json
+
+artifacts:
+  files:
+    - imageDefinitions.json
