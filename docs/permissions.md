@@ -31,6 +31,7 @@ The provided policy allows management of:
 - S3 buckets prefixed with 'providence-'
 - EFS file systems for persistence
 - Service Discovery resources
+- ACM certificates for HTTPS load balancer
 
 ## Policy File
 Save as `providence-policy.json`:
@@ -115,13 +116,14 @@ Save as `providence-policy.json`:
             "Resource": "*"
         },
         {
-          "Effect": "Allow",
-          "Action": [
-              "iam:UploadServerCertificate",
-              "iam:DeleteServerCertificate",
-              "iam:GetServerCertificate"
-          ],
-          "Resource": "arn:aws:iam::*:server-certificate/providence-*"
+            "Effect": "Allow",
+            "Action": [
+                "acm:ImportCertificate",
+                "acm:DeleteCertificate",
+                "acm:DescribeCertificate",
+                "acm:ListCertificates"
+            ],
+            "Resource": "arn:aws:acm:*:*:certificate/*"
         }
     ]
 }
