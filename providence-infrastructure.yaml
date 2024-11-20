@@ -73,17 +73,12 @@ Parameters:
   # SSL Certificate
   CertificateArn:
     Type: String
-    Default: "arn:aws:acm:us-east-1:610596410572:certificate/7359f508-ff59-4e65-86bc-5be677e9f77b"
+    Default: ''
     Description: ARN of ACM certificate for HTTPS listener
     NoEcho: true
 
-  # ProvidenceAPI image
-  ImageURI:
-    Type: String
-    Description: ECR Image URI for the Providence API Docker image
-
 Resources:
-  # VPC with minimal but sufficient CIDR range
+  # VPC
   ProvidenceVPC:
     Type: AWS::EC2::VPC
     Properties:
@@ -130,6 +125,21 @@ Resources:
       Tags:
         - Key: Name
           Value: !Sub ${AWS::StackName}-public-2
+
+  # NAT Gateway
+  NatGatewayEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+  
+  NatGateway:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      AllocationId: !GetAtt NatGatewayEIP.AllocationId
+      SubnetId: !Ref PublicSubnet1
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-nat-gateway"
 
   # Private subnet in first AZ
   PrivateSubnet:
@@ -181,31 +191,84 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-private-rt"
 
+  PrivateRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGateway
+
   PrivateSubnetRouteTableAssociation:
     Type: AWS::EC2::SubnetRouteTableAssociation
     Properties:
       RouteTableId: !Ref PrivateRouteTable
       SubnetId: !Ref PrivateSubnet
 
-  # S3 VPC Endpoint for secure bucket access
-  S3VpcEndpoint:
+  # EFS VPC Interface Endpoint
+  EfsEndpoint:
     Type: AWS::EC2::VPCEndpoint
     Properties:
       VpcId: !Ref ProvidenceVPC
-      ServiceName: !Sub "com.amazonaws.${AWS::Region}.s3"
-      VpcEndpointType: Gateway
-      PolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal: '*'
-            Action:
-              - s3:GetObject
-              - s3:PutObject
-            Resource:
-              - !Sub "${SessionStorageBucket.Arn}/*"
-      RouteTableIds:
-        - !Ref PrivateRouteTable
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.elasticfilesystem"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EfsEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  # Security Group for EFS Endpoint
+  EfsEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for EFS VPC endpoint
+      VpcId: !Ref ProvidenceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref PostgresSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref QdrantSecurityGroup
+
+  # CloudWatch Logs VPC Endpoint for secure access
+  CloudWatchLogsEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcId: !Ref ProvidenceVPC
+      ServiceName: !Sub "com.amazonaws.${AWS::Region}.logs"
+      VpcEndpointType: Interface
+      SubnetIds:
+        - !Ref PublicSubnet1
+        - !Ref PublicSubnet2
+      SecurityGroupIds:
+        - !Ref CloudWatchLogsEndpointSecurityGroup
+
+  # CloudWatch Logs Endpoint Security Group
+  CloudWatchLogsEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for CloudWatch Logs VPC endpoint
+      VpcId: !Ref ProvidenceVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref PostgresSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref RedisSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref QdrantSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref ProvidenceApiSecurityGroup
 
   # ALB Security Group
   AlbSecurityGroup:
@@ -233,11 +296,20 @@ Resources:
       GroupDescription: Security group for Providence API service
       VpcId: !Ref ProvidenceVPC
       SecurityGroupEgress:
-        # HTTPS for S3 (through VPC gateway endpoint), OpenAI, and FindIP
+        # HTTPS out to S3, OpenAI, and FindIP
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
           CidrIp: 0.0.0.0/0
+
+  ApiEgressToCloudWatchLogs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref ProvidenceApiSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref CloudWatchLogsEndpointSecurityGroup
 
   # ALB to API ingress rule (allows inbound traffic to API)
   AlbtoApiIngress:
@@ -260,7 +332,6 @@ Resources:
           FromPort: 5432
           ToPort: 5432
           SourceSecurityGroupId: !Ref ProvidenceApiSecurityGroup
-      SecurityGroupEgress: []
 
   ApiToPostgressEgress:
     Type: AWS::EC2::SecurityGroupEgress
@@ -270,6 +341,34 @@ Resources:
       IpProtocol: tcp
       FromPort: 5432
       ToPort: 5432
+
+  PostgresEgressToCloudWatchLogs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PostgresSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref CloudWatchLogsEndpointSecurityGroup
+
+  # HTTPS outbound for image pull
+  PostgresHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PostgresSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  PostgresToEfsEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref PostgresSecurityGroup
+      DestinationSecurityGroupId: !Ref EfsEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
 
   # Redis Security Group
   RedisSecurityGroup:
@@ -282,7 +381,6 @@ Resources:
           FromPort: 6379
           ToPort: 6379
           SourceSecurityGroupId: !Ref ProvidenceApiSecurityGroup
-      SecurityGroupEgress: []
 
   ApiToRedisEgress:
     Type: AWS::EC2::SecurityGroupEgress
@@ -292,6 +390,25 @@ Resources:
       IpProtocol: tcp
       FromPort: 6379
       ToPort: 6379
+
+  RedisEgressToCloudWatchLogs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref CloudWatchLogsEndpointSecurityGroup
+
+  # HTTPS outbound for image pull
+  RedisHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref RedisSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
 
   # Qdrant Security Group
   QdrantSecurityGroup:
@@ -304,7 +421,6 @@ Resources:
           FromPort: 6333
           ToPort: 6333
           SourceSecurityGroupId: !Ref ProvidenceApiSecurityGroup
-      SecurityGroupEgress: []
 
   ApiToQdrantEgress:
     Type: AWS::EC2::SecurityGroupEgress
@@ -315,9 +431,39 @@ Resources:
       FromPort: 6333
       ToPort: 6333
 
+  QdrantEgressToCloudWatchLogs:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref QdrantSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      DestinationSecurityGroupId: !Ref CloudWatchLogsEndpointSecurityGroup
+
+  # HTTPS outbound for image pull
+  QdrantHttpsEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref QdrantSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  QdrantToEfsEndpointEgress:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref QdrantSecurityGroup
+      DestinationSecurityGroupId: !Ref EfsEndpointSecurityGroup
+      IpProtocol: tcp
+      FromPort: 2049
+      ToPort: 2049
+
   # Application Load Balancer
   ProvidenceALB:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    DependsOn:
+      - InternetGatewayAttachment
     Properties:
       Name: !Sub "${AWS::StackName}-alb"
       Scheme: internet-facing
@@ -381,39 +527,10 @@ Resources:
         - Key: Name
           Value: !Sub "${AWS::StackName}-tg"
 
-  # EFS Security Group - allows NFS traffic from ECS tasks
-  EfsSecurityGroup:
-    Type: AWS::EC2::SecurityGroup
-    Properties:
-      GroupDescription: Security group for Providence EFS mounts
-      VpcId: !Ref ProvidenceVPC
-      SecurityGroupEgress: []
-      Tags:
-        - Key: Name
-          Value: !Sub "${AWS::StackName}-efs-sg"
-
-  EfsPostgresIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EfsSecurityGroup
-      SourceSecurityGroupId: !Ref PostgresSecurityGroup
-      IpProtocol: tcp
-      FromPort: 2049
-      ToPort: 2049
-
-  EfsQdrantIngress:
-    Type: AWS::EC2::SecurityGroupIngress
-    Properties:
-      GroupId: !Ref EfsSecurityGroup
-      SourceSecurityGroupId: !Ref QdrantSecurityGroup
-      IpProtocol: tcp
-      FromPort: 2049
-      ToPort: 2049
-
-  # S3 Bucket for session files with secure defaults
+  # S3 Bucket for session files
   SessionStorageBucket:
     Type: AWS::S3::Bucket
-    DeletionPolicy: RetainExceptOnCreate
+    DeletionPolicy: Retain
     Properties:
       BucketName: !Sub "${AWS::StackName}-sessions"
       BucketEncryption:
@@ -453,7 +570,7 @@ Resources:
               Bool:
                 aws:SecureTransport: false
 
-  # ECS Task Execution Role - allows ECS to pull images, write logs, etc.
+  # ECS Task Execution Role - allows ECS to mount EFS, write logs, etc.
   EcsTaskExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -473,11 +590,16 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  - s3:PutObject
-                  - s3:GetObject
-                Resource: !Sub "${SessionStorageBucket.Arn}/*"
+                  - logs:DescribeLogStreams
+                  - elasticfilesystem:ClientMount
+                  - elasticfilesystem:ClientWrite
+                  - elasticfilesystem:DescribeMountTargets
+                Resource:
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:*:log-stream:*"
+                  - !Sub "arn:aws:elasticfilesystem:${AWS::Region}:${AWS::AccountId}:file-system/*"
 
-  # Generic Task Role for ECS Exec (used by container services not including API)
+  # Generic Task Role for ECS Exec (used by each container service except API)
   ProvidenceServiceTaskRole:
     Type: AWS::IAM::Role
     Properties:
@@ -530,21 +652,12 @@ Resources:
             Statement:
               - Effect: Allow
                 Action:
-                  # HeadBucketCommand
-                  - s3:HeadBucket
-                  # CreateBucketCommand
-                  - s3:CreateBucket
-                  # PutObjectCommand
-                  - s3:PutObject
-                  # GetObjectCommand
-                  - s3:GetObject
+                  - s3:*
                 Resource:
-                  # HeadBucket and CreateBucket need bucket-level permissions
                   - !Sub "${SessionStorageBucket.Arn}"
-                  # PutObject and GetObject need object-level permissions
                   - !Sub "${SessionStorageBucket.Arn}/*"
 
-  # await AWSServiceRoleForECS
+  # await AWSServiceRoleForECS creation
   ECSServicelinkedRole:
     Type: 'AWS::IAM::ServiceLinkedRole'
     Properties:
@@ -569,8 +682,6 @@ Resources:
           Logging: OVERRIDE
           LogConfiguration:
             CloudWatchLogGroupName: !Ref EcsExecuteCommandLogGroup
-            S3BucketName: !Ref SessionStorageBucket
-            S3KeyPrefix: ecs-execute-command-logs
 
   # CloudWatch Log Group for ECS Execute Command
   EcsExecuteCommandLogGroup:
@@ -579,7 +690,7 @@ Resources:
       LogGroupName: !Sub "${AWS::StackName}-ecs-execute-command"
       RetentionInDays: 14
 
-  # Service Discovery Namespace for inter-service communication
+  # Service Discovery Namespace
   ServiceDiscoveryNamespace:
     Type: AWS::ServiceDiscovery::PrivateDnsNamespace
     Properties:
@@ -597,16 +708,16 @@ Resources:
         - Key: Name
           Value: !Sub ${AWS::StackName}-postgres-efs
 
-  # PostgreSQL EFS Mount Target in our private subnet
+  # PostgreSQL EFS Mount Target
   PostgresEfsMountTarget:
     Type: AWS::EFS::MountTarget
     Properties:
       FileSystemId: !Ref PostgresEfsFileSystem
       SecurityGroups:
-        - !Ref EfsSecurityGroup
+        - !Ref EfsEndpointSecurityGroup
       SubnetId: !Ref PrivateSubnet
 
-  # Service Discovery entry for PostgreSQL to enable inter-service communication
+  # Service Discovery entry for PostgreSQL
   PostgresServiceDiscoveryEntry:
     Type: AWS::ServiceDiscovery::Service
     Properties:
@@ -620,6 +731,10 @@ Resources:
   # ECS Task Definition for PostgreSQL
   PostgresTaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - PostgresEfsFileSystem
+      - PostgresEfsMountTarget
+      - EfsEndpoint
     Properties:
       Family: !Sub "${AWS::StackName}-postgres"
       Cpu: '512'
@@ -631,7 +746,8 @@ Resources:
       TaskRoleArn: !Ref ProvidenceServiceTaskRole
       ContainerDefinitions:
         - Name: postgres
-          Image: postgres:15
+          Image: public.ecr.aws/y4m2m2h6/postgres:latest
+          StartTimeout: 300
           Essential: true
           Environment:
             - Name: POSTGRES_USER
@@ -654,9 +770,7 @@ Resources:
           HealthCheck:
             Command:
               - CMD-SHELL
-              - !Sub
-                - "pg_isready -U ${postgres_user}"
-                - postgres_user: !Ref PostgresUser
+              - !Sub "pg_isready -U ${PostgresUser} -d ${PostgresDbName}"
             Interval: 30
             Timeout: 5
             Retries: 3
@@ -674,13 +788,14 @@ Resources:
       LogGroupName: !Sub "${AWS::StackName}-postgres"
       RetentionInDays: 14
 
-  # PostgreSQL ECS Service - runs and maintains desired count of Postgres tasks
+  # PostgreSQL ECS Service
   PostgresService:
     Type: AWS::ECS::Service
     DependsOn:
       - PostgresEfsMountTarget
       - PostgresServiceDiscoveryEntry
       - PostgresEfsFileSystem
+      - EfsEndpoint
     Properties:
       ServiceName: !Sub "${AWS::StackName}-postgres"
       Cluster: !Ref ProvidenceCluster
@@ -728,7 +843,7 @@ Resources:
       TaskRoleArn: !Ref ProvidenceServiceTaskRole
       ContainerDefinitions:
         - Name: redis
-          Image: redis/redis-stack-server:latest
+          Image: public.ecr.aws/y4m2m2h6/redis-stack-server:latest
           Essential: true
           Environment:
             - Name: REDIS_ARGS
@@ -797,8 +912,22 @@ Resources:
     Properties:
       FileSystemId: !Ref QdrantEfsFileSystem
       SecurityGroups:
-        - !Ref EfsSecurityGroup
+        - !Ref EfsEndpointSecurityGroup
       SubnetId: !Ref PrivateSubnet
+
+  QdrantEfsAccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref QdrantEfsFileSystem
+      PosixUser:
+        Uid: "1000"
+        Gid: "1000"
+      RootDirectory:
+        CreationInfo:
+          OwnerUid: "1000" # UID for 'qdrant'
+          OwnerGid: "1000" # GID for 'qdrant'
+          Permissions: "0755"
+        Path: "/storage"
 
   QdrantServiceDiscoveryEntry:
     Type: AWS::ServiceDiscovery::Service
@@ -813,6 +942,11 @@ Resources:
   # ECS Task Definition for Qdrant
   QdrantTaskDefinition:
     Type: AWS::ECS::TaskDefinition
+    DependsOn:
+      - QdrantEfsMountTarget
+      - QdrantEfsAccessPoint
+      - QdrantEfsFileSystem
+      - EfsEndpoint
     Properties:
       Family: !Sub "${AWS::StackName}-qdrant"
       Cpu: '1024'
@@ -823,9 +957,11 @@ Resources:
       ExecutionRoleArn: !Ref EcsTaskExecutionRole
       TaskRoleArn: !Ref ProvidenceServiceTaskRole
       ContainerDefinitions:
+        # Main
         - Name: qdrant
-          Image: qdrant/qdrant:latest
-          Essential: true
+          Image: public.ecr.aws/y4m2m2h6/qdrant:latest
+          StartTimeout: 300
+          Essential: false
           Environment:
             - Name: QDRANT__SERVICE__API_KEY
               Value: !Ref QdrantApiKey
@@ -840,21 +976,40 @@ Resources:
               awslogs-group: !Ref QdrantLogGroup
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: qdrant
+
+        # Sidecar
+        - Name: healthcheck
+          Image: public.ecr.aws/y4m2m2h6/curl:latest
+          Essential: true
+          DependsOn:
+            - Condition: START
+              ContainerName: qdrant
+          EntryPoint:
+            - sh
+            - -c
+          Command:
+            - "while true; do curl -f http://localhost:6333/healthz || exit 1; sleep 30; done"
           HealthCheck:
             Command:
               - CMD-SHELL
-              - !Sub
-                - "curl -H 'api-key: ${qdrant_api_key}' -f http://localhost:6333/health"
-                - qdrant_api_key: !Ref QdrantApiKey
+              - curl -f http://localhost:6333/healthz || exit 1
             Interval: 30
             Timeout: 5
             Retries: 3
             StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref QdrantLogGroup
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: qdrant-healthcheck
       Volumes:
         - Name: qdrant-data
           EFSVolumeConfiguration:
             FilesystemId: !Ref QdrantEfsFileSystem
             TransitEncryption: ENABLED
+            AuthorizationConfig:
+              AccessPointId: !Ref QdrantEfsAccessPoint
 
   QdrantLogGroup:
     Type: AWS::Logs::LogGroup
@@ -868,6 +1023,7 @@ Resources:
       - QdrantEfsMountTarget
       - QdrantServiceDiscoveryEntry
       - QdrantEfsFileSystem
+      - EfsEndpoint
     Properties:
       ServiceName: !Sub "${AWS::StackName}-qdrant"
       Cluster: !Ref ProvidenceCluster
@@ -888,7 +1044,6 @@ Resources:
             - !Ref PrivateSubnet
       EnableExecuteCommand: true
 
-
   # CloudWatch Log Group for API container logs
   ProvidenceApiLogGroup:
     Type: AWS::Logs::LogGroup
@@ -901,7 +1056,6 @@ Resources:
     Type: AWS::ECS::TaskDefinition
     Properties:
       Family: !Sub "${AWS::StackName}-api"
-      # Using moderate resources to start - can be adjusted based on needs
       Cpu: '1024'    # 1 vCPU
       Memory: '2048' # 2GB RAM
       NetworkMode: awsvpc
@@ -911,7 +1065,7 @@ Resources:
       TaskRoleArn: !Ref ProvidenceApiTaskRole
       ContainerDefinitions:
         - Name: providence-api
-          Image: !Ref ImageURI
+          Image: public.ecr.aws/y4m2m2h6/providence-api:latest
           Essential: true
           PortMappings:
             - ContainerPort: !Ref ApiPort
@@ -974,7 +1128,6 @@ Resources:
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: api
 
-          # Health check to ensure API is responding
           HealthCheck:
             Command: 
               - CMD-SHELL
@@ -1018,48 +1171,6 @@ Resources:
 
 
 Outputs:
-  VpcId:
-    Description: VPC ID
-    Value: !Ref ProvidenceVPC
-    Export:
-      Name: !Sub "${AWS::StackName}-vpc-id"
-
-  PublicSubnet1:
-    Description: Public Subnet ID
-    Value: !Ref PublicSubnet1
-    Export:
-      Name: !Sub "${AWS::StackName}-public-subnet-1"
-
-  PublicSubnet2:
-    Description: Public Subnet ID
-    Value: !Ref PublicSubnet2
-    Export:
-      Name: !Sub "${AWS::StackName}-public-subnet-2"
-
-  PrivateSubnet:
-    Description: Private Subnet ID  
-    Value: !Ref PrivateSubnet
-    Export:
-      Name: !Sub "${AWS::StackName}-private-subnet"
-
-  AlbSecurityGroup:
-    Description: ALB Security Group ID
-    Value: !Ref AlbSecurityGroup
-    Export:
-      Name: !Sub "${AWS::StackName}-alb-sg"
-
-  ProvidenceApiSecurityGroup:
-    Description: Providence API Security Group ID
-    Value: !Ref ProvidenceApiSecurityGroup
-    Export:
-      Name: !Sub "${AWS::StackName}-api-sg"
-
-  LoadBalancerDns:
-    Description: ALB DNS Name
-    Value: !GetAtt ProvidenceALB.DNSName
-    Export:
-      Name: !Sub "${AWS::StackName}-alb-dns"
-
   LoadBalancerUrl:
     Description: ALB HTTPS URL
     Value: !Sub "https://${ProvidenceALB.DNSName}"

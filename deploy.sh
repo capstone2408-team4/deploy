@@ -1,25 +1,25 @@
 #!/bin/bash
 
 # Disable AWS CLI pagination
-# export AWS_PAGER=""
+export AWS_PAGER=""
 
 echo "Providence AWS Infrastructure Deployment"
 echo "======================================="
 
 # Verify AWS CLI installation and auth
 if ! command -v aws &> /dev/null; then
-    echo "Error: AWS CLI not installed. Visit: https://aws.amazon.com/cli/"
+    echo "❌ Error: AWS CLI not installed. Visit: https://aws.amazon.com/cli/"
     exit 1
 fi
 
 if ! aws sts get-caller-identity &> /dev/null; then
-    echo "Error: AWS CLI not authenticated. Run: aws configure"
+    echo "❌ Error: AWS CLI not authenticated. Run: aws configure"
     exit 1
 fi
 
 # Check for .env file
 if [ ! -f .env ]; then
-    echo "Error: No .env file found. Copy .env.example to .env and fill in values."
+    echo "❌ Error: No .env file found. Copy .env.example to .env and fill in values."
     exit 1
 fi
 
@@ -52,7 +52,7 @@ for var in "${required_vars[@]}"; do
 done
 
 if [ ${#missing_vars[@]} -ne 0 ]; then
-    echo "Error: Missing required variables in .env:"
+    echo "❌ Error: Missing required variables in .env:"
     printf '%s\n' "${missing_vars[@]}"
     exit 1
 fi
@@ -61,28 +61,42 @@ fi
 # Store sensitive configuration in Secrets Manager
 echo "Storing configuration secrets securely..."
 
-# Database configuration
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/postgres-user" --secret-string "$POSTGRES_USER"  --force-overwrite-replica-secret
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/postgres-password" --secret-string "$POSTGRES_PASSWORD"  --force-overwrite-replica-secret
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/postgres-db-name" --secret-string "$POSTGRES_DB_NAME"  --force-overwrite-replica-secret
+secret_names=(
+    "postgres-user|$POSTGRES_USER"
+    "postgres-password|$POSTGRES_PASSWORD"
+    "postgres-db-name|$POSTGRES_DB_NAME"
+    "redis-password|$REDIS_PASSWORD"
+    "qdrant-api-key|$QDRANT_API_KEY"
+    "openai-api-key|$OPENAI_API_KEY"
+    "findip-api-key|$FINDIP_API_KEY"
+    "jwt-secret|$JWT_SECRET"
+    "root-project|$PROVIDENCE_ROOT_PROJECT"
+    "root-password|$PROVIDENCE_ROOT_PASSWORD"
+)
 
-# Redis configuration
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/redis-password" --secret-string "$REDIS_PASSWORD"  --force-overwrite-replica-secret
-
-# Qdrant configuration
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/qdrant-api-key" --secret-string "$QDRANT_API_KEY"  --force-overwrite-replica-secret
-
-# External APIs
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/openai-api-key" --secret-string "$OPENAI_API_KEY"  --force-overwrite-replica-secret
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/findip-api-key" --secret-string "$FINDIP_API_KEY"  --force-overwrite-replica-secret
-
-# Authentication
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/jwt-secret" --secret-string "$JWT_SECRET"  --force-overwrite-replica-secret
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/root-project" --secret-string "$PROVIDENCE_ROOT_PROJECT"  --force-overwrite-replica-secret
-aws secretsmanager create-secret --region "${AWS_REGION}" --name "/providence/${ENVIRONMENT}/root-password" --secret-string "$PROVIDENCE_ROOT_PASSWORD"  --force-overwrite-replica-secret
-
+# Loop through each secret
+for entry in "${secret_names[@]}"; do
+    key="${entry%%|*}"
+    value="${entry#*|}"
+    secret_name="/providence/${ENVIRONMENT}/${key}"
+    
+    # Check if the secret exists
+    if aws secretsmanager describe-secret --secret-id "$secret_name" > /dev/null 2>&1; then
+        echo "Updating secret: $secret_name"
+        aws secretsmanager put-secret-value \
+            --secret-id "$secret_name" \
+            --secret-string "$value"
+    else
+        echo "Creating secret: $secret_name"
+        aws secretsmanager create-secret \
+            --region "$AWS_REGION" \
+            --name "$secret_name" \
+            --secret-string "$value"
+    fi
+done
 
 # Generate and import self-signed certificate
+echo ""
 echo "Generating and importing self-signed certificate..."
 CERT_DIR="$(mktemp -d)"
 DOMAIN="*.${ENVIRONMENT}.providence.local"
@@ -105,85 +119,69 @@ CERT_ARN="$(aws acm import-certificate \
 rm -rf "${CERT_DIR}"
 
 
-# Deploy CodeBuild Infrastructure
-echo "Deploying CodeBuild infrastructure stack..."
-aws cloudformation deploy \
-    --template-file codebuild-infrastructure.yaml \
-    --stack-name "providence-${ENVIRONMENT}-codebuild-infra" \
-    --capabilities CAPABILITY_NAMED_IAM \
-    --region "${AWS_REGION}" \
-    --parameter-overrides \
-        Environment="${ENVIRONMENT}"
+# Function to monitor stack resources
+monitor_stack() {
+    local stack_name="$1"
 
-if [ $? -ne 0 ]; then
-    echo "❌ CodeBuild Infrastructure deployment failed"
-    exit 1
-fi
+    while true; do
+        # Capture the resources state
+        resources=$(aws cloudformation describe-stack-resources \
+            --stack-name "$stack_name" \
+            --region "${AWS_REGION}" \
+            --query "StackResources[?ResourceStatus=='CREATE_IN_PROGRESS' || ResourceStatus=='UPDATE_IN_PROGRESS' || ResourceStatus=='CREATE_FAILED' || ResourceStatus=='UPDATE_FAILED'].[Timestamp,LogicalResourceId,ResourceStatus]" \
+            --output table \
+            --color on \
+            --no-paginate \
+            --no-cli-pager)
 
-echo "✅ CodeBuild Infrastructure deployment successful!"
+        # Output the resources state
+        echo ""
+        echo "$resources"
 
+        # Spin for 15
+        start_time=$(date +%s)
+        end_time=$((start_time + 15))
+        
+        i=0
+        sp="-\|/"
+        while [ "$(date +%s)" -lt "$end_time" ]; do
+            printf "\b%c" "${sp:i%4:1}"
+            sleep 0.1
+            ((i++))
+        done
+        printf "\r" # Clear spinner
 
-# Retrieve outputs from the codebuild infrastructure stack
-ECR_URI=$(aws cloudformation describe-stacks \
-    --stack-name "providence-${ENVIRONMENT}-codebuild-infra" \
-    --region "${AWS_REGION}" \
-    --query "Stacks[0].Outputs[?OutputKey=='EcrRepositoryUri'].OutputValue" \
-    --output text)
+        # Count the output lines
+        lines=$(( $(echo "$resources" | wc -l) + 1))
 
-CODEBUILD_PROJECT_NAME=$(aws cloudformation describe-stacks \
-    --stack-name "providence-${ENVIRONMENT}-codebuild-infra" \
-    --region "${AWS_REGION}" \
-    --query "Stacks[0].Outputs[?OutputKey=='CodeBuildProjectName'].OutputValue" \
-    --output text)
+        # Clear the resources output for next poll
+        for ((j=0; j<lines; j++)); do
+            tput el    # Clear the line
+            tput cuu1  # Move up one line
+            tput el    # Clear the line
+        done
 
-if [ -z "$ECR_URI" ] || [ -z "$CODEBUILD_PROJECT_NAME" ]; then
-    echo "Error: Failed to retrieve outputs from codebuild infrastructure stack."
-    exit 1
-fi
-
-echo "ECR Repository URI: $ECR_URI"
-echo "CodeBuild Project Name: $CODEBUILD_PROJECT_NAME"
-
-
-# Read the buildspec.yml
-BUILDSPEC_CONTENT=$(cat buildspec.yml)
-
-# Start CodeBuild project
-echo "Starting CodeBuild project..."
-BUILD_ID=$(aws codebuild start-build \
-    --project-name "$CODEBUILD_PROJECT_NAME" \
-    --region "${AWS_REGION}" \
-    --buildspec-override "$BUILDSPEC_CONTENT" \
-    --query 'build.id' \
-    --output text)
-
-if [ -z "$BUILD_ID" ]; then
-    echo "Error: Failed to start CodeBuild project."
-    exit 1
-fi
-
-# Wait for CodeBuild project to complete
-echo "Waiting for CodeBuild project to complete..."
-BUILD_STATUS=""
-while [ "$BUILD_STATUS" != "SUCCEEDED" ] && [ "$BUILD_STATUS" != "FAILED" ]; do
-    sleep 10
-    BUILD_STATUS=$(aws codebuild batch-get-builds \
-        --ids "$BUILD_ID" \
-        --region "${AWS_REGION}" \
-        --query 'builds[0].buildStatus' \
-        --output text)
-done
-
-if [ "$BUILD_STATUS" == "FAILED" ]; then
-    echo "Error: CodeBuild project failed."
-    exit 1
-fi
-
-echo "CodeBuild project completed successfull!"
-
+        # Capture the status of the entire deployment
+        status=$(aws cloudformation describe-stacks \
+            --stack-name "$stack_name" \
+            --region "${AWS_REGION}" \
+            --query 'Stacks[0].StackStatus' \
+            --output text 2>&1)
+        
+        # Break if finished or failed or stack does not exist
+        if [[ $status =~ .*COMPLETE$ || $status =~ .*FAILED$ || $status == *"does not exist"* ]]; then
+            break
+        fi
+        
+    done
+}
 
 # Deploy Providence infrastructure
+echo ""
 echo "Deploying Providence infrastructure stack..."
+echo "Only limited progress output will be shown here. Please view your AWS CloudFormation console for complete information!"
+
+# Run deployment in background
 aws cloudformation deploy \
     --template-file providence-infrastructure.yaml \
     --stack-name "providence-${ENVIRONMENT}" \
@@ -192,21 +190,35 @@ aws cloudformation deploy \
     --parameter-overrides \
         Environment="${ENVIRONMENT}" \
         ApiPort="${API_PORT}" \
-        # CertificateArn="${CERT_ARN}" \
-        ImageURI="${ECR_URI}:latest" \
-        PostgresUser="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/postgres-user}}" \
-        PostgresPassword="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/postgres-password}}" \
-        PostgresDbName="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/postgres-db-name}}" \
-        RedisPassword="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/redis-password}}" \
-        QdrantApiKey="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/qdrant-api-key}}" \
-        OpenAiApiKey="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/openai-api-key}}" \
-        FindIpApiKey="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/findip-api-key}}" \
-        JwtSecret="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/jwt-secret}}" \
-        ProvidenceRootProject="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/root-project}}" \
-        ProvidenceRootPassword="{{resolve:secretsmanager:/providence/${ENVIRONMENT}/root-password}}" \
+        CertificateArn="${CERT_ARN}" \
+        PostgresUser='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/postgres-user}}' \
+        PostgresPassword='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/postgres-password}}' \
+        PostgresDbName='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/postgres-db-name}}' \
+        RedisPassword='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/redis-password}}' \
+        QdrantApiKey='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/qdrant-api-key}}' \
+        OpenAiApiKey='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/openai-api-key}}' \
+        FindIpApiKey='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/findip-api-key}}' \
+        JwtSecret='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/jwt-secret}}' \
+        ProvidenceRootProject='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/root-project}}' \
+        ProvidenceRootPassword='{{resolve:secretsmanager:/providence/'"${ENVIRONMENT}"'/root-password}}' &
 
-if [ $? -eq 0 ]; then
+# Capture the PID of the deployment process
+DEPLOY_PID=$!
+
+# Artifical pause to prevent initial error message while the stack is being created in AWS
+sleep 15
+
+# Start the monitoring loop
+monitor_stack "providence-${ENVIRONMENT}"
+
+# Wait for the deployment to finish and capture the exit status
+wait "$DEPLOY_PID"
+DEPLOY_STATUS=$?
+
+if [ $DEPLOY_STATUS -eq 0 ]; then
+    echo ""
     echo "✅ Deployment successful!"
+    echo ""
     
     # Display outputs
     aws cloudformation describe-stacks \
@@ -214,6 +226,7 @@ if [ $? -eq 0 ]; then
         --query 'Stacks[0].Outputs[*].[OutputKey,OutputValue]' \
         --output table
 else
+    echo ""
     echo "❌ Deployment failed"
     exit 1
 fi
