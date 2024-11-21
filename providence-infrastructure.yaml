@@ -296,7 +296,7 @@ Resources:
       GroupDescription: Security group for Providence API service
       VpcId: !Ref ProvidenceVPC
       SecurityGroupEgress:
-        # HTTPS out to S3, OpenAI, and FindIP
+        # HTTPS out to S3, OpenAI, and FindIP via NAT Gateway
         - IpProtocol: tcp
           FromPort: 443
           ToPort: 443
@@ -742,8 +742,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
-      ExecutionRoleArn: !Ref EcsTaskExecutionRole
-      TaskRoleArn: !Ref ProvidenceServiceTaskRole
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProvidenceServiceTaskRole.Arn
       ContainerDefinitions:
         - Name: postgres
           Image: public.ecr.aws/y4m2m2h6/postgres:latest
@@ -839,8 +839,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
-      ExecutionRoleArn: !Ref EcsTaskExecutionRole
-      TaskRoleArn: !Ref ProvidenceServiceTaskRole
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProvidenceServiceTaskRole.Arn
       ContainerDefinitions:
         - Name: redis
           Image: public.ecr.aws/y4m2m2h6/redis-stack-server:latest
@@ -954,8 +954,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
-      ExecutionRoleArn: !Ref EcsTaskExecutionRole
-      TaskRoleArn: !Ref ProvidenceServiceTaskRole
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProvidenceServiceTaskRole.Arn
       ContainerDefinitions:
         # Main
         - Name: qdrant
@@ -1051,6 +1051,16 @@ Resources:
       LogGroupName: !Sub "${AWS::StackName}-api"
       RetentionInDays: 14
 
+  ProvidenceApiServiceDiscoveryEntry:
+    Type: AWS::ServiceDiscovery::Service
+    Properties:
+      Name: providence-api
+      DnsConfig:
+        NamespaceId: !Ref ServiceDiscoveryNamespace
+        DnsRecords:
+          - Type: A
+            TTL: 300
+
   # ECS Task Definition for Providence API
   ProvidenceApiTaskDefinition:
     Type: AWS::ECS::TaskDefinition
@@ -1061,8 +1071,8 @@ Resources:
       NetworkMode: awsvpc
       RequiresCompatibilities:
         - FARGATE
-      ExecutionRoleArn: !Ref EcsTaskExecutionRole
-      TaskRoleArn: !Ref ProvidenceApiTaskRole
+      ExecutionRoleArn: !GetAtt EcsTaskExecutionRole.Arn
+      TaskRoleArn: !GetAtt ProvidenceApiTaskRole.Arn
       ContainerDefinitions:
         - Name: providence-api
           Image: public.ecr.aws/y4m2m2h6/providence-api:latest
@@ -1151,6 +1161,10 @@ Resources:
       TaskDefinition: !Ref ProvidenceApiTaskDefinition
       DesiredCount: 1
       LaunchType: FARGATE
+      ServiceRegistries:
+        - RegistryArn: !GetAtt ProvidenceApiServiceDiscoveryEntry.Arn
+          ContainerName: providence-api
+          # ContainerPort: !Ref ApiPort
       LoadBalancers:
         - ContainerName: providence-api
           ContainerPort: !Ref ApiPort
@@ -1158,12 +1172,11 @@ Resources:
       HealthCheckGracePeriodSeconds: 60
       NetworkConfiguration:
         AwsvpcConfiguration:
-          AssignPublicIp: ENABLED
+          AssignPublicIp: DISABLED
           SecurityGroups:
             - !Ref ProvidenceApiSecurityGroup
           Subnets:
-            - !Ref PublicSubnet1
-            - !Ref PublicSubnet2
+            - !Ref PrivateSubnet
       DeploymentConfiguration:
         MinimumHealthyPercent: 100
         MaximumPercent: 200
