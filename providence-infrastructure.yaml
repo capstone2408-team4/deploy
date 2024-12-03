@@ -746,7 +746,7 @@ Resources:
       TaskRoleArn: !GetAtt ProvidenceServiceTaskRole.Arn
       ContainerDefinitions:
         - Name: postgres
-          Image: public.ecr.aws/y4m2m2h6/postgres:latest
+          Image: public.ecr.aws/providencereplay/postgres:latest
           StartTimeout: 300
           Essential: true
           Environment:
@@ -843,7 +843,7 @@ Resources:
       TaskRoleArn: !GetAtt ProvidenceServiceTaskRole.Arn
       ContainerDefinitions:
         - Name: redis
-          Image: public.ecr.aws/y4m2m2h6/redis-stack-server:latest
+          Image: public.ecr.aws/providencereplay/redis-stack-server:latest
           Essential: true
           Environment:
             - Name: REDIS_ARGS
@@ -959,7 +959,7 @@ Resources:
       ContainerDefinitions:
         # Main
         - Name: qdrant
-          Image: public.ecr.aws/y4m2m2h6/qdrant:latest
+          Image: public.ecr.aws/providencereplay/qdrant:latest
           StartTimeout: 300
           Essential: false
           Environment:
@@ -979,7 +979,7 @@ Resources:
 
         # Sidecar
         - Name: healthcheck
-          Image: public.ecr.aws/y4m2m2h6/curl:latest
+          Image: public.ecr.aws/providencereplay/curl:latest
           Essential: true
           DependsOn:
             - Condition: START
@@ -1075,7 +1075,7 @@ Resources:
       TaskRoleArn: !GetAtt ProvidenceApiTaskRole.Arn
       ContainerDefinitions:
         - Name: providence-api
-          Image: public.ecr.aws/y4m2m2h6/providence-api:latest
+          Image: public.ecr.aws/providencereplay/providence-api:latest
           Essential: true
           PortMappings:
             - ContainerPort: !Ref ApiPort
